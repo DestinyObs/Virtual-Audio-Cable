@@ -4,6 +4,7 @@
 #include "endpoints.h"
 #include "minwavert.h"
 #include "minwavertstream.h"
+#include "loopback.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 
 #pragma warning (disable : 4127)
@@ -1364,6 +1365,9 @@ VOID CMiniportWaveRTStream::UpdatePosition
             m_bLastBufferRendered = TRUE;
         }
 
+        // Feed rendered audio to the microphone endpoint.
+        LoopbackRender(ByteDisplacement);
+
         if (!g_DoNotCreateDataFiles)
         {
             // Read from buffer and write to a file.
@@ -1397,7 +1401,8 @@ VOID CMiniportWaveRTStream::WriteBytes
 
 Routine Description:
 
-This function writes the audio buffer using silence instead of a tone generator
+This function fills the capture buffer with audio looped back from the
+speaker endpoint (silence when nothing is playing).
 
 Arguments:
 
@@ -1405,7 +1410,9 @@ ByteDisplacement - # of bytes to process.
 
 --*/
 {
-    ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
+    ULONG   bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
+    ULONG   loopbackBytesPerSample = 0;
+    BOOLEAN loopbackSupported = LoopbackIsFormatSupported(m_pWfExt, &loopbackBytesPerSample);
 
     // Normally this will loop no more than once for a single wrap, but if
     // many bytes have been displaced then this may loops many times.
@@ -1413,11 +1420,56 @@ ByteDisplacement - # of bytes to process.
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
         
-        // Instead of generating a tone, just output silence
-        RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
+        // Fill the capture buffer with audio looped back from the speaker.
+        // Unsupported formats (anything other than 48 kHz stereo PCM) get silence.
+        if (loopbackSupported)
+        {
+            LoopbackRead(m_pDmaBuffer + bufferOffset, runWrite, loopbackBytesPerSample);
+        }
+        else
+        {
+            RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
+        }
            	
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;
+    }
+}
+
+//=============================================================================
+#pragma code_seg()
+VOID CMiniportWaveRTStream::LoopbackRender
+(
+    _In_ ULONG ByteDisplacement
+)
+/*++
+
+Routine Description:
+
+Copies audio rendered by the client into the speaker-to-microphone loopback
+ring buffer.
+
+Arguments:
+
+ByteDisplacement - # of bytes to process.
+
+--*/
+{
+    ULONG bytesPerSample = 0;
+
+    if (!LoopbackIsFormatSupported(m_pWfExt, &bytesPerSample))
+    {
+        return;
+    }
+
+    ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
+
+    while (ByteDisplacement > 0)
+    {
+        ULONG runRead = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+        LoopbackWrite(m_pDmaBuffer + bufferOffset, runRead, bytesPerSample);
+        bufferOffset = (bufferOffset + runRead) % m_ulDmaBufferSize;
+        ByteDisplacement -= runRead;
     }
 }
 

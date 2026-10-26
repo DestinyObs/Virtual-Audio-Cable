@@ -170,6 +170,11 @@ private:
     (
         _In_ ULONG ByteDisplacement
     );
+
+    VOID LoopbackRender
+    (
+        _In_ ULONG ByteDisplacement
+    );
     
     VOID UpdatePosition
     (

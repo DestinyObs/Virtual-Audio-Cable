@@ -1,0 +1,125 @@
+name: Build test-signed package
+
+# Builds the x64 Release driver, test-signs it with a throwaway self-signed
+# certificate, and publishes a ready-to-install package as a workflow artifact.
+# The package installs only on machines with test signing enabled.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      CONFIGURATION: Release
+      PLATFORM: x64
+      PACKAGE_NAME: VirtualAudioCable-x64
+      CERT_SUBJECT: CN=Virtual Audio Cable Test Signing
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Windows Driver Kit
+        shell: pwsh
+        run: |
+          choco install windowsdriverkit11 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "WDK install failed" }
+
+      - name: Build driver
+        shell: pwsh
+        run: |
+          msbuild VirtualAudioDriver.sln `
+            /m /nologo /v:minimal `
+            /p:Configuration=$env:CONFIGURATION `
+            /p:Platform=$env:PLATFORM `
+            /p:SignMode=Off `
+            /p:EnableInf2cat=false `
+            /p:InfVerif_Enable=false `
+            /p:RunCodeAnalysis=false
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+      - name: Locate build outputs and WDK tools
+        id: locate
+        shell: pwsh
+        run: |
+          $sys = Get-ChildItem -Recurse -Filter VirtualAudioDriver.sys |
+                 Where-Object { $_.FullName -match "\\$env:PLATFORM\\$env:CONFIGURATION\\" } |
+                 Select-Object -First 1
+          $inf = Get-ChildItem -Recurse -Filter VirtualAudioDriver.inf |
+                 Where-Object { $_.FullName -match "\\$env:PLATFORM\\$env:CONFIGURATION\\" } |
+                 Select-Object -First 1
+          if (-not $sys) { throw "VirtualAudioDriver.sys not found" }
+          if (-not $inf) { throw "Stamped VirtualAudioDriver.inf not found" }
+
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe |
+                      Where-Object { $_.FullName -match "\\x64\\" } |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          $inf2cat  = Get-ChildItem $kits -Recurse -Filter Inf2Cat.exe |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          if (-not $inf2cat)  { throw "Inf2Cat.exe not found" }
+
+          "sys=$($sys.FullName)"           >> $env:GITHUB_OUTPUT
+          "inf=$($inf.FullName)"           >> $env:GITHUB_OUTPUT
+          "signtool=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+          "inf2cat=$($inf2cat.FullName)"   >> $env:GITHUB_OUTPUT
+
+      - name: Assemble, catalog and test-sign package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signtool = '${{ steps.locate.outputs.signtool }}'
+          $inf2cat  = '${{ steps.locate.outputs.inf2cat }}'
+
+          $out    = Join-Path $PWD "dist\$env:PACKAGE_NAME"
+          $driver = Join-Path $out 'driver'
+          New-Item -ItemType Directory -Force -Path $driver | Out-Null
+
+          Copy-Item '${{ steps.locate.outputs.sys }}' $driver
+          Copy-Item '${{ steps.locate.outputs.inf }}' $driver
+
+          # Throwaway test certificate, created fresh for every build.
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+                    -Subject $env:CERT_SUBJECT `
+                    -CertStoreLocation Cert:\CurrentUser\My `
+                    -KeyExportPolicy NonExportable `
+                    -NotAfter (Get-Date).AddYears(3)
+          Export-Certificate -Cert $cert -FilePath (Join-Path $out 'VirtualAudioCable-TestCert.cer') | Out-Null
+
+          # The catalog hashes the .sys, so sign the .sys first.
+          & $signtool sign /fd SHA256 /s My /sha1 $cert.Thumbprint (Join-Path $driver 'VirtualAudioDriver.sys')
+          if ($LASTEXITCODE -ne 0) { throw "Signing .sys failed" }
+
+          & $inf2cat /driver:$driver /os:10_X64 /verbose
+          if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed" }
+
+          $cat = Get-ChildItem $driver -Filter *.cat | Select-Object -First 1
+          if (-not $cat) { throw "Catalog not produced" }
+          & $signtool sign /fd SHA256 /s My /sha1 $cert.Thumbprint $cat.FullName
+          if ($LASTEXITCODE -ne 0) { throw "Signing catalog failed" }
+
+          # Informational only: a self-signed test certificate is not chained to a
+          # trusted root on the build machine, so verify is expected to complain.
+          & $signtool verify /pa /v $cat.FullName
+          $global:LASTEXITCODE = 0
+
+          Copy-Item tools\Install.ps1, tools\Uninstall.ps1, tools\README.txt $out
+          Get-ChildItem -Recurse $out | Select-Object FullName, Length
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualAudioCable-x64-test-signed
+          path: dist/VirtualAudioCable-x64
+          if-no-files-found: error
