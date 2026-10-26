@@ -1457,6 +1457,11 @@ ByteDisplacement - # of bytes to process.
 {
     ULONG bytesPerSample = 0;
 
+    if (m_pDmaBuffer == NULL || m_ulDmaBufferSize == 0)
+    {
+        return;
+    }
+
     if (!LoopbackIsFormatSupported(m_pWfExt, &bytesPerSample))
     {
         return;
